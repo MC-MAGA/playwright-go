@@ -1,5 +1,10 @@
 package playwright
 
+import (
+	"encoding/json"
+	"fmt"
+)
+
 type channel struct {
 	eventEmitter
 	guid       string
@@ -8,50 +13,71 @@ type channel struct {
 	object     interface{}   // retain type info (for fromChannel needed)
 }
 
+func (c *channel) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]string{
+		"guid": c.guid,
+	})
+}
+
+// for catch errors of route handlers etc.
+func (c *channel) CreateTask(fn func()) {
+	go func() {
+		defer func() {
+			if e := recover(); e != nil {
+				err, ok := e.(error)
+				if ok {
+					c.connection.err.Set(err)
+				} else {
+					c.connection.err.Set(fmt.Errorf("%v", e))
+				}
+			}
+		}()
+		fn()
+	}()
+}
+
 func (c *channel) Send(method string, options ...interface{}) (interface{}, error) {
 	return c.connection.WrapAPICall(func() (interface{}, error) {
-		return c.innerSend(method, false, options...)
-	}, false)
+		return c.innerSend(method, options...).GetResultValue()
+	}, c.owner.isInternalType)
 }
 
-func (c *channel) SendReturnAsDict(method string, options ...interface{}) (interface{}, error) {
-	return c.connection.WrapAPICall(func() (interface{}, error) {
-		return c.innerSend(method, true, options...)
-	}, true)
+func (c *channel) SendReturnAsDict(method string, options ...interface{}) (map[string]interface{}, error) {
+	ret, err := c.connection.WrapAPICall(func() (interface{}, error) {
+		return c.innerSend(method, options...).GetResult()
+	}, c.owner.isInternalType)
+	return ret.(map[string]interface{}), err
 }
 
-func (c *channel) innerSend(method string, returnAsDict bool, options ...interface{}) (interface{}, error) {
+func (c *channel) innerSend(method string, options ...interface{}) *protocolCallback {
+	if err := c.connection.err.Get(); err != nil {
+		c.connection.err.Set(nil)
+		pc := newProtocolCallback(false, c.connection.abort)
+		pc.SetError(err)
+		return pc
+	}
 	params := transformOptions(options...)
-	callback, err := c.connection.sendMessageToServer(c.owner, method, params, false)
-	if err != nil {
-		return nil, err
-	}
-	result, err := callback.GetResult()
-	if err != nil {
-		return nil, err
-	}
-	if result == nil {
-		return nil, nil
-	}
-	if returnAsDict {
-		return result, nil
-	}
-	if mapV, ok := result.(map[string]interface{}); ok && len(mapV) <= 1 {
-		for key := range mapV {
-			return mapV[key], nil
-		}
-		return nil, nil
-	}
-	return result, nil
+	return c.connection.sendMessageToServer(c.owner, method, params, false)
 }
 
+// SendNoReply ignores return value and errors
+// almost equivalent to `send(...).catch(() => {})`
 func (c *channel) SendNoReply(method string, options ...interface{}) {
+	c.innerSendNoReply(method, c.owner.isInternalType, options...)
+}
+
+func (c *channel) SendNoReplyInternal(method string, options ...interface{}) {
+	c.innerSendNoReply(method, true, options...)
+}
+
+func (c *channel) innerSendNoReply(method string, isInternal bool, options ...interface{}) {
 	params := transformOptions(options...)
 	_, err := c.connection.WrapAPICall(func() (interface{}, error) {
-		return c.connection.sendMessageToServer(c.owner, method, params, true)
-	}, false)
+		return c.connection.sendMessageToServer(c.owner, method, params, true).GetResult()
+	}, isInternal)
 	if err != nil {
-		logger.Printf("SendNoReply failed: %v\n", err)
+		// ignore error actively, log only for debug
+		logger.Error("SendNoReply failed", "error", err)
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/go-stack/stack"
+	"github.com/playwright-community/playwright-go/internal/safe"
 )
 
 var (
@@ -19,18 +20,13 @@ var (
 	apiNameTransform     = regexp.MustCompile(`(?U)\(\*(.+)(Impl)?\)`)
 )
 
-type result struct {
-	Data  interface{}
-	Error error
-}
-
 type connection struct {
 	transport    transport
 	apiZone      sync.Map
-	objects      map[string]*channelOwner
+	objects      *safe.SyncMap[string, *channelOwner]
 	lastID       atomic.Uint32
 	rootObject   *rootChannelOwner
-	callbacks    sync.Map
+	callbacks    *safe.SyncMap[uint32, *protocolCallback]
 	afterClose   func()
 	onClose      func() error
 	isRemote     bool
@@ -38,6 +34,7 @@ type connection struct {
 	tracingCount atomic.Int32
 	abort        chan struct{}
 	abortOnce    sync.Once
+	err          *safeValue[error] // for event listener error
 	closedError  *safeValue[error]
 }
 
@@ -97,21 +94,17 @@ func (c *connection) Dispatch(msg *message) {
 	method := msg.Method
 	if msg.ID != 0 {
 		cb, _ := c.callbacks.LoadAndDelete(uint32(msg.ID))
-		if cb.(*protocolCallback).noReply {
+		if cb.noReply {
 			return
 		}
 		if msg.Error != nil {
-			cb.(*protocolCallback).SetResult(result{
-				Error: parseError(msg.Error.Error),
-			})
+			cb.SetError(parseError(msg.Error.Error))
 		} else {
-			cb.(*protocolCallback).SetResult(result{
-				Data: c.replaceGuidsWithChannels(msg.Result),
-			})
+			cb.SetResult(c.replaceGuidsWithChannels(msg.Result).(map[string]interface{}))
 		}
 		return
 	}
-	object := c.objects[msg.GUID]
+	object, _ := c.objects.Load(msg.GUID)
 	if method == "__create__" {
 		c.createRemoteObject(
 			object, msg.Params["type"].(string), msg.Params["guid"].(string), msg.Params["initializer"],
@@ -122,7 +115,7 @@ func (c *connection) Dispatch(msg *message) {
 		return
 	}
 	if method == "__adopt__" {
-		child, ok := c.objects[msg.Params["guid"].(string)]
+		child, ok := c.objects.Load(msg.Params["guid"].(string))
 		if !ok {
 			return
 		}
@@ -163,33 +156,6 @@ func (c *connection) WrapAPICall(cb func() (interface{}, error), isInternal bool
 	return cb()
 }
 
-func (c *connection) replaceChannelsWithGuids(payload interface{}) interface{} {
-	if payload == nil {
-		return nil
-	}
-	if channel, isChannel := payload.(*channel); isChannel {
-		return map[string]string{
-			"guid": channel.guid,
-		}
-	}
-	v := reflect.ValueOf(payload)
-	if v.Kind() == reflect.Slice {
-		listV := make([]interface{}, 0)
-		for i := 0; i < v.Len(); i++ {
-			listV = append(listV, c.replaceChannelsWithGuids(v.Index(i).Interface()))
-		}
-		return listV
-	}
-	if v.Kind() == reflect.Map {
-		mapV := make(map[string]interface{})
-		for _, key := range v.MapKeys() {
-			mapV[key.String()] = c.replaceChannelsWithGuids(v.MapIndex(key).Interface())
-		}
-		return mapV
-	}
-	return payload
-}
-
 func (c *connection) replaceGuidsWithChannels(payload interface{}) interface{} {
 	if payload == nil {
 		return nil
@@ -205,7 +171,7 @@ func (c *connection) replaceGuidsWithChannels(payload interface{}) interface{} {
 	if v.Kind() == reflect.Map {
 		mapV := payload.(map[string]interface{})
 		if guid, hasGUID := mapV["guid"]; hasGUID {
-			if channelOwner, ok := c.objects[guid.(string)]; ok {
+			if channelOwner, ok := c.objects.Load(guid.(string)); ok {
 				return channelOwner.channel
 			}
 		}
@@ -217,16 +183,20 @@ func (c *connection) replaceGuidsWithChannels(payload interface{}) interface{} {
 	return payload
 }
 
-func (c *connection) sendMessageToServer(object *channelOwner, method string, params interface{}, noReply bool) (*protocolCallback, error) {
+func (c *connection) sendMessageToServer(object *channelOwner, method string, params interface{}, noReply bool) (cb *protocolCallback) {
+	cb = newProtocolCallback(noReply, c.abort)
+
 	if err := c.closedError.Get(); err != nil {
-		return nil, err
+		cb.SetError(err)
+		return
 	}
 	if object.wasCollected {
-		return nil, errors.New("The object has been collected to prevent unbounded heap growth.")
+		cb.SetError(errors.New("The object has been collected to prevent unbounded heap growth."))
+		return
 	}
 
 	id := c.lastID.Add(1)
-	cb, _ := c.callbacks.LoadOrStore(id, newProtocolCallback(noReply, c.abort))
+	c.callbacks.Store(id, cb)
 	var (
 		metadata = make(map[string]interface{}, 0)
 		stack    = make([]map[string]interface{}, 0)
@@ -243,7 +213,7 @@ func (c *connection) sendMessageToServer(object *channelOwner, method string, pa
 		"id":       id,
 		"guid":     object.guid,
 		"method":   method,
-		"params":   c.replaceChannelsWithGuids(params),
+		"params":   params, // channel.MarshalJSON will replace channel with guid
 		"metadata": metadata,
 	}
 	if c.tracingCount.Load() > 0 && len(stack) > 0 && object.guid != "localUtils" {
@@ -251,10 +221,11 @@ func (c *connection) sendMessageToServer(object *channelOwner, method string, pa
 	}
 
 	if err := c.transport.Send(message); err != nil {
-		return nil, fmt.Errorf("could not send message: %w", err)
+		cb.SetError(fmt.Errorf("could not send message: %w", err))
+		return
 	}
 
-	return cb.(*protocolCallback), nil
+	return
 }
 
 func (c *connection) setInTracing(isTracing bool) {
@@ -327,9 +298,11 @@ func serializeCallLocation(caller stack.Call) map[string]interface{} {
 func newConnection(transport transport, localUtils ...*localUtilsImpl) *connection {
 	connection := &connection{
 		abort:       make(chan struct{}, 1),
-		objects:     make(map[string]*channelOwner),
+		callbacks:   safe.NewSyncMap[uint32, *protocolCallback](),
+		objects:     safe.NewSyncMap[string, *channelOwner](),
 		transport:   transport,
 		isRemote:    false,
+		err:         &safeValue[error]{},
 		closedError: &safeValue[error]{},
 	}
 	if len(localUtils) > 0 {
@@ -352,41 +325,66 @@ func fromNullableChannel(v interface{}) interface{} {
 }
 
 type protocolCallback struct {
-	callback chan result
-	noReply  bool
-	abort    <-chan struct{}
+	done    chan struct{}
+	noReply bool
+	abort   <-chan struct{}
+	once    sync.Once
+	value   map[string]interface{}
+	err     error
 }
 
-func (pc *protocolCallback) SetResult(r result) {
+func (pc *protocolCallback) setResultOnce(result map[string]interface{}, err error) {
+	pc.once.Do(func() {
+		pc.value = result
+		pc.err = err
+		close(pc.done)
+	})
+}
+
+func (pc *protocolCallback) waitResult() {
 	if pc.noReply {
 		return
 	}
 	select {
+	case <-pc.done: // wait for result
+		return
 	case <-pc.abort:
 		select {
-		case pc.callback <- r:
+		case <-pc.done:
+			return
 		default:
+			pc.err = errors.New("Connection closed")
+			return
 		}
-		return
-	case pc.callback <- r:
 	}
 }
 
-func (pc *protocolCallback) GetResult() (interface{}, error) {
-	if pc.noReply {
-		return nil, nil
+func (pc *protocolCallback) SetError(err error) {
+	pc.setResultOnce(nil, err)
+}
+
+func (pc *protocolCallback) SetResult(result map[string]interface{}) {
+	pc.setResultOnce(result, nil)
+}
+
+func (pc *protocolCallback) GetResult() (map[string]interface{}, error) {
+	pc.waitResult()
+	return pc.value, pc.err
+}
+
+// GetResultValue returns value if the map has only one element
+func (pc *protocolCallback) GetResultValue() (interface{}, error) {
+	pc.waitResult()
+	if len(pc.value) == 0 { // empty map treated as nil
+		return nil, pc.err
 	}
-	select {
-	case result := <-pc.callback:
-		return result.Data, result.Error
-	case <-pc.abort:
-		select {
-		case result := <-pc.callback:
-			return result.Data, result.Error
-		default:
-			return nil, errors.New("Connection closed")
+	if len(pc.value) == 1 {
+		for key := range pc.value {
+			return pc.value[key], pc.err
 		}
 	}
+
+	return pc.value, pc.err
 }
 
 func newProtocolCallback(noReply bool, abort <-chan struct{}) *protocolCallback {
@@ -397,7 +395,7 @@ func newProtocolCallback(noReply bool, abort <-chan struct{}) *protocolCallback 
 		}
 	}
 	return &protocolCallback{
-		callback: make(chan result, 1),
-		abort:    abort,
+		done:  make(chan struct{}, 1),
+		abort: abort,
 	}
 }

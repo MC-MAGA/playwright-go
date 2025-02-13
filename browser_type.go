@@ -52,6 +52,14 @@ func (b *browserTypeImpl) LaunchPersistentContext(userDataDir string, options ..
 			}
 			options[0].AcceptDownloads = nil
 		}
+		if options[0].ClientCertificates != nil {
+			certs, err := transformClientCertificate(options[0].ClientCertificates)
+			if err != nil {
+				return nil, err
+			}
+			overrides["clientCertificates"] = certs
+			options[0].ClientCertificates = nil
+		}
 		if options[0].ExtraHttpHeaders != nil {
 			overrides["extraHTTPHeaders"] = serializeMapToNameAndValue(options[0].ExtraHttpHeaders)
 			options[0].ExtraHttpHeaders = nil
@@ -97,7 +105,7 @@ func (b *browserTypeImpl) Connect(wsEndpoint string, options ...BrowserTypeConne
 	if err != nil {
 		return nil, err
 	}
-	jsonPipe := fromChannel(pipe.(map[string]interface{})["pipe"]).(*jsonPipe)
+	jsonPipe := fromChannel(pipe["pipe"]).(*jsonPipe)
 	connection := newConnection(jsonPipe, localUtils)
 
 	playwright, err := connection.Start()
@@ -138,9 +146,9 @@ func (b *browserTypeImpl) ConnectOverCDP(endpointURL string, options ...BrowserT
 	if err != nil {
 		return nil, err
 	}
-	browser := fromChannel(response.(map[string]interface{})["browser"]).(*browserImpl)
+	browser := fromChannel(response["browser"]).(*browserImpl)
 	b.didLaunchBrowser(browser)
-	if defaultContext, ok := response.(map[string]interface{})["defaultContext"]; ok {
+	if defaultContext, ok := response["defaultContext"]; ok {
 		context := fromChannel(defaultContext).(*browserContextImpl)
 		b.didCreateContext(context, nil, nil)
 	}

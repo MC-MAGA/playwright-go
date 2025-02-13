@@ -5,9 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sync"
 
-	"golang.org/x/exp/slices"
+	"github.com/playwright-community/playwright-go/internal/safe"
 )
 
 type pageImpl struct {
@@ -24,9 +25,10 @@ type pageImpl struct {
 	workers         []Worker
 	mainFrame       Frame
 	routes          []*routeHandlerEntry
+	webSocketRoutes []*webSocketRouteHandler
 	viewportSize    *Size
 	ownedContext    BrowserContext
-	bindings        map[string]BindingCallFunction
+	bindings        *safe.SyncMap[string, BindingCallFunction]
 	closeReason     *string
 	closeWasCalled  bool
 	harRouters      []*harRouter
@@ -82,29 +84,27 @@ func (p *pageImpl) onLocatorHandlerTriggered(uid float64) {
 			remove = Bool(true)
 		}
 	}
-	go func() {
-		defer func() {
-			if remove != nil && *remove {
-				delete(p.locatorHandlers, uid)
-			}
-			_, _ = p.connection.WrapAPICall(func() (interface{}, error) {
-				p.channel.SendNoReply("resolveLocatorHandlerNoReply", map[string]any{
-					"uid":    uid,
-					"remove": remove,
-				})
-				return nil, nil
-			}, true)
-		}()
-
-		handler.handler(handler.locator)
+	defer func() {
+		if remove != nil && *remove {
+			delete(p.locatorHandlers, uid)
+		}
+		_, _ = p.connection.WrapAPICall(func() (interface{}, error) {
+			_, err := p.channel.Send("resolveLocatorHandlerNoReply", map[string]any{
+				"uid":    uid,
+				"remove": remove,
+			})
+			return nil, err
+		}, true)
 	}()
+
+	handler.handler(handler.locator)
 }
 
 func (p *pageImpl) RemoveLocatorHandler(locator Locator) error {
 	for uid := range p.locatorHandlers {
 		if p.locatorHandlers[uid].locator.equals(locator) {
 			delete(p.locatorHandlers, uid)
-			_, _ = p.channel.Send("unregisterLocatorHandler", map[string]any{
+			p.channel.SendNoReply("unregisterLocatorHandler", map[string]any{
 				"uid": uid,
 			})
 			return nil
@@ -193,14 +193,14 @@ func (p *pageImpl) Frames() []Frame {
 
 func (p *pageImpl) SetDefaultNavigationTimeout(timeout float64) {
 	p.timeoutSettings.SetDefaultNavigationTimeout(&timeout)
-	p.channel.SendNoReply("setDefaultNavigationTimeoutNoReply", map[string]interface{}{
+	p.channel.SendNoReplyInternal("setDefaultNavigationTimeoutNoReply", map[string]interface{}{
 		"timeout": timeout,
 	})
 }
 
 func (p *pageImpl) SetDefaultTimeout(timeout float64) {
 	p.timeoutSettings.SetDefaultTimeout(&timeout)
-	p.channel.SendNoReply("setDefaultTimeoutNoReply", map[string]interface{}{
+	p.channel.SendNoReplyInternal("setDefaultTimeoutNoReply", map[string]interface{}{
 		"timeout": timeout,
 	})
 }
@@ -783,7 +783,7 @@ func newPage(parent *channelOwner, objectType string, guid string, initializer m
 	bt := &pageImpl{
 		workers:         make([]Worker, 0),
 		routes:          make([]*routeHandlerEntry, 0),
-		bindings:        make(map[string]BindingCallFunction),
+		bindings:        safe.NewSyncMap[string, BindingCallFunction](),
 		viewportSize:    viewportSize,
 		harRouters:      make([]*harRouter, 0),
 		locatorHandlers: make(map[float64]*locatorHandlerEntry, 0),
@@ -818,7 +818,9 @@ func newPage(parent *channelOwner, objectType string, guid string, initializer m
 		bt.onFrameDetached(fromChannel(ev["frame"]).(*frameImpl))
 	})
 	bt.channel.On("locatorHandlerTriggered", func(ev map[string]interface{}) {
-		bt.onLocatorHandlerTriggered(ev["uid"].(float64))
+		bt.channel.CreateTask(func() {
+			bt.onLocatorHandlerTriggered(ev["uid"].(float64))
+		})
 	})
 	bt.channel.On(
 		"load", func(ev map[string]interface{}) {
@@ -829,7 +831,9 @@ func newPage(parent *channelOwner, objectType string, guid string, initializer m
 		bt.Emit("popup", fromChannel(ev["page"]).(*pageImpl))
 	})
 	bt.channel.On("route", func(ev map[string]interface{}) {
-		bt.onRoute(fromChannel(ev["route"]).(*routeImpl))
+		bt.channel.CreateTask(func() {
+			bt.onRoute(fromChannel(ev["route"]).(*routeImpl))
+		})
 	})
 	bt.channel.On("download", func(ev map[string]interface{}) {
 		url := ev["url"].(string)
@@ -843,6 +847,11 @@ func newPage(parent *channelOwner, objectType string, guid string, initializer m
 	})
 	bt.channel.On("webSocket", func(ev map[string]interface{}) {
 		bt.Emit("websocket", fromChannel(ev["webSocket"]).(*webSocketImpl))
+	})
+	bt.channel.On("webSocketRoute", func(ev map[string]interface{}) {
+		bt.channel.CreateTask(func() {
+			bt.onWebSocketRoute(fromChannel(ev["webSocketRoute"]).(*webSocketRouteImpl))
+		})
 	})
 
 	bt.channel.On("worker", func(ev map[string]interface{}) {
@@ -882,8 +891,8 @@ func (p *pageImpl) closeErrorWithReason() error {
 }
 
 func (p *pageImpl) onBinding(binding *bindingCallImpl) {
-	function := p.bindings[binding.initializer["name"].(string)]
-	if function == nil {
+	function, ok := p.bindings.Load(binding.initializer["name"].(string))
+	if !ok || function == nil {
 		return
 	}
 	go binding.Call(function)
@@ -910,55 +919,53 @@ func (p *pageImpl) onFrameDetached(frame *frameImpl) {
 }
 
 func (p *pageImpl) onRoute(route *routeImpl) {
-	go func() {
+	p.Lock()
+	route.context = p.browserContext
+	routes := make([]*routeHandlerEntry, len(p.routes))
+	copy(routes, p.routes)
+	p.Unlock()
+
+	checkInterceptionIfNeeded := func() {
 		p.Lock()
-		route.context = p.browserContext
-		routes := make([]*routeHandlerEntry, len(p.routes))
-		copy(routes, p.routes)
-		p.Unlock()
-
-		checkInterceptionIfNeeded := func() {
-			p.Lock()
-			defer p.Unlock()
-			if len(p.routes) == 0 {
-				_, err := p.connection.WrapAPICall(func() (interface{}, error) {
-					err := p.updateInterceptionPatterns()
-					return nil, err
-				}, true)
-				if err != nil {
-					logger.Printf("could not update interception patterns: %v\n", err)
-				}
+		defer p.Unlock()
+		if len(p.routes) == 0 {
+			_, err := p.connection.WrapAPICall(func() (interface{}, error) {
+				err := p.updateInterceptionPatterns()
+				return nil, err
+			}, true)
+			if err != nil {
+				logger.Error("could not update interception patterns", "error", err)
 			}
 		}
+	}
 
-		url := route.Request().URL()
-		for _, handlerEntry := range routes {
-			// If the page was closed we stall all requests right away.
-			if p.closeWasCalled || p.browserContext.closeWasCalled {
-				return
-			}
-			if !handlerEntry.Matches(url) {
-				continue
-			}
-			if !slices.ContainsFunc(p.routes, func(entry *routeHandlerEntry) bool {
-				return entry == handlerEntry
-			}) {
-				continue
-			}
-			if handlerEntry.WillExceed() {
-				p.routes = slices.DeleteFunc(p.routes, func(rhe *routeHandlerEntry) bool {
-					return rhe == handlerEntry
-				})
-			}
-			handled := handlerEntry.Handle(route)
-			checkInterceptionIfNeeded()
-
-			if <-handled {
-				return
-			}
+	url := route.Request().URL()
+	for _, handlerEntry := range routes {
+		// If the page was closed we stall all requests right away.
+		if p.closeWasCalled || p.browserContext.closeWasCalled {
+			return
 		}
-		p.browserContext.onRoute(route)
-	}()
+		if !handlerEntry.Matches(url) {
+			continue
+		}
+		if !slices.ContainsFunc(p.routes, func(entry *routeHandlerEntry) bool {
+			return entry == handlerEntry
+		}) {
+			continue
+		}
+		if handlerEntry.WillExceed() {
+			p.routes = slices.DeleteFunc(p.routes, func(rhe *routeHandlerEntry) bool {
+				return rhe == handlerEntry
+			})
+		}
+		handled := handlerEntry.Handle(route)
+		checkInterceptionIfNeeded()
+
+		if <-handled {
+			return
+		}
+	}
+	p.browserContext.onRoute(route)
 }
 
 func (p *pageImpl) updateInterceptionPatterns() error {
@@ -1080,18 +1087,21 @@ func (p *pageImpl) ExposeBinding(name string, binding BindingCallFunction, handl
 	if len(handle) == 1 {
 		needsHandle = handle[0]
 	}
-	if _, ok := p.bindings[name]; ok {
+	if _, ok := p.bindings.Load(name); ok {
 		return fmt.Errorf("Function '%s' has been already registered", name)
 	}
-	if _, ok := p.browserContext.bindings[name]; ok {
+	if _, ok := p.browserContext.bindings.Load(name); ok {
 		return fmt.Errorf("Function '%s' has been already registered in the browser context", name)
 	}
-	p.bindings[name] = binding
 	_, err := p.channel.Send("exposeBinding", map[string]interface{}{
 		"name":        name,
 		"needsHandle": needsHandle,
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	p.bindings.Store(name, binding)
+	return nil
 }
 
 func (p *pageImpl) SelectOption(selector string, values SelectOptionValues, options ...PageSelectOptionOptions) ([]string, error) {
@@ -1335,4 +1345,40 @@ func (p *pageImpl) OnWebSocket(fn func(WebSocket)) {
 
 func (p *pageImpl) OnWorker(fn func(Worker)) {
 	p.On("worker", fn)
+}
+
+func (p *pageImpl) RequestGC() error {
+	_, err := p.channel.Send("requestGC")
+	return err
+}
+
+func (p *pageImpl) RouteWebSocket(url interface{}, handler func(WebSocketRoute)) error {
+	p.Lock()
+	defer p.Unlock()
+	p.webSocketRoutes = slices.Insert(p.webSocketRoutes, 0, newWebSocketRouteHandler(newURLMatcher(url, p.browserContext.options.BaseURL), handler))
+
+	return p.updateWebSocketInterceptionPatterns()
+}
+
+func (p *pageImpl) onWebSocketRoute(wr WebSocketRoute) {
+	p.Lock()
+	index := slices.IndexFunc(p.webSocketRoutes, func(r *webSocketRouteHandler) bool {
+		return r.Matches(wr.URL())
+	})
+	if index == -1 {
+		p.Unlock()
+		p.browserContext.onWebSocketRoute(wr)
+		return
+	}
+	handler := p.webSocketRoutes[index]
+	p.Unlock()
+	handler.Handle(wr)
+}
+
+func (p *pageImpl) updateWebSocketInterceptionPatterns() error {
+	patterns := prepareWebSocketRouteHandlerInterceptionPatterns(p.webSocketRoutes)
+	_, err := p.channel.Send("setWebSocketInterceptionPatterns", map[string]interface{}{
+		"patterns": patterns,
+	})
+	return err
 }

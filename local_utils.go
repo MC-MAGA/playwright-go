@@ -50,11 +50,10 @@ func (l *localUtilsImpl) HarOpen(file string) (string, error) {
 		},
 	})
 	if err == nil {
-		value := result.(map[string]interface{})
-		if harId, ok := value["harId"]; ok {
+		if harId, ok := result["harId"]; ok {
 			return harId.(string), nil
 		}
-		if err, ok := value["error"]; ok {
+		if err, ok := result["error"]; ok {
 			return "", fmt.Errorf("%w:%v", ErrPlaywright, err)
 		}
 	}
@@ -81,10 +80,6 @@ func (l *localUtilsImpl) HarLookup(option harLookupOptions) (*harLookupResult, e
 	ret, err := l.channel.SendReturnAsDict("harLookup", overrides)
 	if ret == nil {
 		return nil, err
-	}
-	retMap, ok := ret.(map[string]interface{})
-	if !ok {
-		return nil, fmt.Errorf("expected harLookupResult, got %T", retMap)
 	}
 	var result harLookupResult
 	mJson, err := json.Marshal(ret)
@@ -165,5 +160,6 @@ func newLocalUtils(parent *channelOwner, objectType string, guid string, initial
 		}
 		remapMapToStruct(entry["descriptor"], l.Devices[entry["name"].(string)])
 	}
+	l.markAsInternalType()
 	return l
 }

@@ -13,7 +13,7 @@ jobs:
     - name: Set up Go 1.x
       uses: actions/setup-go@v5
       with:
-        go-version: ^1.19.9
+        go-version: oldstable
       id: go
     - name: golangci-lint
       uses: golangci/golangci-lint-action@v6
@@ -23,12 +23,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Stick with macos-13 for now which is Intel-based until
-        # https://github.com/microsoft/playwright/issues/30705 is fixed.
-        os: [ubuntu-latest, windows-latest, macos-13]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         browser: [chromium, firefox, webkit]
+        go: ['stable', 'oldstable']
     runs-on: ${{ matrix.os }}
-    name:  ${{ matrix.browser }} on ${{ matrix.os }}
+    name:  ${{ matrix.browser }} on ${{ matrix.os }}, go ${{ matrix.go }}
     steps:
     - uses: actions/checkout@v4
       with:
@@ -36,7 +35,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: ^1.19.9
+        go-version: ${{ matrix.go }}
       id: go
     - name: Cache drivers
       uses: actions/cache@v4
@@ -52,7 +51,7 @@ jobs:
           ~/Library/Caches/ms-playwright
           ~\AppData\Local\ms-playwright-go
           ~\AppData\Local\ms-playwright
-        key: ${{ runner.os }}-go-${{ matrix.browser }}-${{ hashFiles('**/run.go') }}
+        key: ${{ runner.os }}-go${{ matrix.go }}-${{ matrix.browser }}-${{ hashFiles('**/run.go') }}
     - run: |
         go install ./...
         playwright install --with-deps ${{ matrix.browser }}
@@ -84,7 +83,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: ^1.19.9
+        go-version: oldstable
       id: go
     - name: Install goveralls
       run: go install github.com/mattn/goveralls@latest
@@ -99,7 +98,7 @@ jobs:
     - name: Set up Go 1.x
       uses: actions/setup-go@v5
       with:
-        go-version: ^1.19.9
+        go-version: oldstable
       id: go
     - run: |
         go install ./...

@@ -4,8 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-
-	"github.com/playwright-community/playwright-go/internal/multierror"
 )
 
 var (
@@ -35,7 +33,7 @@ func newLocator(frame *frameImpl, selector string, options ...LocatorLocatorOpti
 	if option.Has != nil {
 		has := option.Has.(*locatorImpl)
 		if frame != has.frame {
-			locator.err = multierror.Join(locator.err, ErrLocatorNotSameFrame)
+			locator.err = errors.Join(locator.err, ErrLocatorNotSameFrame)
 		} else {
 			selector += fmt.Sprintf(` >> internal:has=%s`, escapeText(has.selector))
 		}
@@ -43,7 +41,7 @@ func newLocator(frame *frameImpl, selector string, options ...LocatorLocatorOpti
 	if option.HasNot != nil {
 		hasNot := option.HasNot.(*locatorImpl)
 		if frame != hasNot.frame {
-			locator.err = multierror.Join(locator.err, ErrLocatorNotSameFrame)
+			locator.err = errors.Join(locator.err, ErrLocatorNotSameFrame)
 		} else {
 			selector += fmt.Sprintf(` >> internal:has-not=%s`, escapeText(hasNot.selector))
 		}
@@ -130,6 +128,19 @@ func (l *locatorImpl) Blur(options ...LocatorBlurOptions) error {
 	return err
 }
 
+func (l *locatorImpl) AriaSnapshot(options ...LocatorAriaSnapshotOptions) (string, error) {
+	var option LocatorAriaSnapshotOptions
+	if len(options) == 1 {
+		option = options[0]
+	}
+	ret, err := l.frame.channel.Send("ariaSnapshot", option,
+		map[string]interface{}{"selector": l.selector})
+	if err != nil {
+		return "", err
+	}
+	return ret.(string), nil
+}
+
 func (l *locatorImpl) BoundingBox(options ...LocatorBoundingBoxOptions) (*Rect, error) {
 	if l.err != nil {
 		return nil, l.err
@@ -170,9 +181,8 @@ func (l *locatorImpl) Clear(options ...LocatorClearOptions) error {
 	}
 	if len(options) == 1 {
 		return l.Fill("", LocatorFillOptions{
-			Force:       options[0].Force,
-			NoWaitAfter: options[0].NoWaitAfter,
-			Timeout:     options[0].Timeout,
+			Force:   options[0].Force,
+			Timeout: options[0].Timeout,
 		})
 	} else {
 		return l.Fill("")
@@ -599,7 +609,7 @@ func (l *locatorImpl) Locator(selectorOrLocator interface{}, options ...LocatorL
 	locator, ok := selectorOrLocator.(*locatorImpl)
 	if ok {
 		if l.frame != locator.frame {
-			l.err = multierror.Join(l.err, ErrLocatorNotSameFrame)
+			l.err = errors.Join(l.err, ErrLocatorNotSameFrame)
 			return l
 		}
 		return newLocator(l.frame,
@@ -607,7 +617,7 @@ func (l *locatorImpl) Locator(selectorOrLocator interface{}, options ...LocatorL
 			options...,
 		)
 	}
-	l.err = multierror.Join(l.err, fmt.Errorf("invalid locator parameter: %v", selectorOrLocator))
+	l.err = errors.Join(l.err, fmt.Errorf("invalid locator parameter: %v", selectorOrLocator))
 	return l
 }
 
@@ -863,7 +873,7 @@ func (l *locatorImpl) expect(expression string, options frameExpectOptions) (*fr
 		overrides["expectedValue"] = serializeArgument(options.ExpectedValue)
 		options.ExpectedValue = nil
 	}
-	response, err := l.frame.channel.SendReturnAsDict("expect", options, overrides)
+	result, err := l.frame.channel.SendReturnAsDict("expect", options, overrides)
 	if err != nil {
 		return nil, err
 	}
@@ -872,15 +882,14 @@ func (l *locatorImpl) expect(expression string, options frameExpectOptions) (*fr
 		matches  bool
 		log      []string
 	)
-	responseMap := response.(map[string]interface{})
 
-	if v, ok := responseMap["received"]; ok {
+	if v, ok := result["received"]; ok {
 		received = parseResult(v)
 	}
-	if v, ok := responseMap["matches"]; ok {
+	if v, ok := result["matches"]; ok {
 		matches = v.(bool)
 	}
-	if v, ok := responseMap["log"]; ok {
+	if v, ok := result["log"]; ok {
 		for _, l := range v.([]interface{}) {
 			log = append(log, l.(string))
 		}

@@ -23,34 +23,21 @@ func (t *tracingImpl) Start(options ...TracingStartOptions) error {
 		if _, err := t.channel.Send("tracingStart", options); err != nil {
 			return "", err
 		}
-
-		result, err := t.channel.Send("tracingStartChunk", chunkOption)
-		if err != nil {
-			return nil, err
-		}
-		name, ok := result.(string)
-		if !ok {
-			name = ""
-		}
-		return nil, t.startCollectingStacks(name)
+		return t.channel.Send("tracingStartChunk", chunkOption)
 	}
-	_, err := t.connection.WrapAPICall(innerStart, true)
-	return err
+	name, err := innerStart()
+	if err != nil {
+		return err
+	}
+	return t.startCollectingStacks(name.(string))
 }
 
 func (t *tracingImpl) StartChunk(options ...TracingStartChunkOptions) error {
-	_, err := t.connection.WrapAPICall(func() (interface{}, error) {
-		result, err := t.channel.Send("tracingStartChunk", options)
-		if err != nil {
-			return nil, err
-		}
-		name, ok := result.(string)
-		if !ok {
-			name = ""
-		}
-		return nil, t.startCollectingStacks(name)
-	}, true)
-	return err
+	name, err := t.channel.Send("tracingStartChunk", options)
+	if err != nil {
+		return err
+	}
+	return t.startCollectingStacks(name.(string))
 }
 
 func (t *tracingImpl) StopChunk(path ...string) error {
@@ -58,10 +45,7 @@ func (t *tracingImpl) StopChunk(path ...string) error {
 	if len(path) == 1 {
 		filePath = path[0]
 	}
-	_, err := t.connection.WrapAPICall(func() (interface{}, error) {
-		return nil, t.doStopChunk(filePath)
-	}, true)
-	return err
+	return t.doStopChunk(filePath)
 }
 
 func (t *tracingImpl) Stop(path ...string) error {
@@ -69,12 +53,10 @@ func (t *tracingImpl) Stop(path ...string) error {
 	if len(path) == 1 {
 		filePath = path[0]
 	}
-	_, err := t.connection.WrapAPICall(func() (interface{}, error) {
-		if err := t.doStopChunk(filePath); err != nil {
-			return nil, err
-		}
-		return t.channel.Send("tracingStop")
-	}, true)
+	if err := t.doStopChunk(filePath); err != nil {
+		return err
+	}
+	_, err := t.channel.Send("tracingStop")
 	return err
 }
 
@@ -102,7 +84,7 @@ func (t *tracingImpl) doStopChunk(filePath string) (err error) {
 		if err != nil {
 			return err
 		}
-		entries, ok := result.(map[string]interface{})["entries"]
+		entries, ok := result["entries"]
 		if !ok {
 			return fmt.Errorf("could not convert result to map: %v", result)
 		}
@@ -122,7 +104,7 @@ func (t *tracingImpl) doStopChunk(filePath string) (err error) {
 	if err != nil {
 		return err
 	}
-	artifactChannel, ok := result.(map[string]interface{})["artifact"]
+	artifactChannel, ok := result["artifact"]
 	if !ok {
 		return fmt.Errorf("could not convert result to map: %v", result)
 	}
@@ -160,8 +142,23 @@ func (t *tracingImpl) startCollectingStacks(name string) (err error) {
 	return
 }
 
+func (t *tracingImpl) Group(name string, options ...TracingGroupOptions) error {
+	var option TracingGroupOptions
+	if len(options) == 1 {
+		option = options[0]
+	}
+	_, err := t.channel.Send("tracingGroup", option, map[string]interface{}{"name": name})
+	return err
+}
+
+func (t *tracingImpl) GroupEnd() error {
+	_, err := t.channel.Send("tracingGroupEnd")
+	return err
+}
+
 func newTracing(parent *channelOwner, objectType string, guid string, initializer map[string]interface{}) *tracingImpl {
 	bt := &tracingImpl{}
 	bt.createChannelOwner(bt, parent, objectType, guid, initializer)
+	bt.markAsInternalType()
 	return bt
 }
