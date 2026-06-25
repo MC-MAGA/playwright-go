@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/playwright-community/playwright-go"
 	"github.com/stretchr/testify/require"
@@ -264,6 +265,73 @@ func TestNetworkEventsShouldFireEventsInProperOrder(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, response.Finished())
 	require.Equal(t, []string{"request", "response", "requestfinished"}, events)
+}
+
+// TestBlockingServerCallInsideEventHandler reproduces the deadlock cluster
+// (#391, #481, #398, #524, #574): making a blocking server round-trip from
+// inside an event handler must not freeze the connection dispatcher.
+func TestBlockingServerCallInsideEventHandler(t *testing.T) {
+	BeforeEach(t)
+
+	type result struct {
+		headers []playwright.NameValue
+		body    []byte
+		err     error
+	}
+	done := make(chan result, 1)
+	page.OnResponse(func(response playwright.Response) {
+		// HeadersArray() and Body() each issue a blocking server call.
+		// Before the fix these run on the dispatcher goroutine and deadlock.
+		headers, err := response.HeadersArray()
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+		body, err := response.Body()
+		done <- result{headers: headers, body: body, err: err}
+	})
+
+	_, err := page.Goto(server.EMPTY_PAGE)
+	require.NoError(t, err)
+
+	select {
+	case res := <-done:
+		require.NoError(t, res.err)
+		require.NotEmpty(t, res.headers)
+	case <-time.After(10 * time.Second):
+		t.Fatal("blocking server call inside an event handler deadlocked the dispatcher")
+	}
+}
+
+// TestRequestHeadersArrayInsideRouteHandler reproduces #519: calling
+// Request().HeadersArray() (or any header accessor) from inside a route handler
+// must not stall the request. The accessor previously waited on Response(),
+// which only resolves after the route is continued, deadlocking the handler.
+func TestRequestHeadersArrayInsideRouteHandler(t *testing.T) {
+	BeforeEach(t)
+
+	headersCh := make(chan []playwright.NameValue, 1)
+	err := page.Route("**/*", func(route playwright.Route) {
+		headers, err := route.Request().HeadersArray()
+		require.NoError(t, err)
+		headersCh <- headers
+		require.NoError(t, route.Continue())
+	})
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := page.Goto(server.EMPTY_PAGE)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+		require.NotEmpty(t, <-headersCh)
+	case <-time.After(15 * time.Second):
+		t.Fatal("HeadersArray() inside a route handler deadlocked the request (#519)")
+	}
 }
 
 func TestRequestExistingResponse(t *testing.T) {
